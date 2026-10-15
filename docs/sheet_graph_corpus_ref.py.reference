@@ -1,0 +1,843 @@
+#!/usr/bin/env python3
+"""Spreadsheet workbooks <-> this project's graph-record format, both directions.
+
+The analogue of ``dom_graph_corpus.py`` for .xlsx workbooks. Importable without
+``mathesis.repr2x2`` (openpyxl only), and shared by the corpus builder, the
+roundtrip check and the text-pack builder so the three cannot drift.
+
+THE SHAPE, and why every choice is what it is. The pipeline decides which
+nodes carry a payload, a name or a reference edge FROM THE LABEL HEAD ALONE
+(``pyscope.payload_kind_of_label`` / ``label_bears_name`` /
+``label_makes_ref_decision``): payloads live on ``Lit <kind>``, names on
+``Free``, edges leave ``Ref``. A first version of this corpus hung payloads on
+``Value`` / ``Row`` / ``Cell`` nodes and the pack would have dropped every one
+of them silently. So:
+
+    Workbook                                 root
+      Free f:sheet        name = title       one per sheet with content
+        Free f:row        name = "7"         one per non-empty row, ABSOLUTE
+                                             index (non-empty rows are sparse;
+                                             child position would say row 5
+                                             and row 50 are adjacent)
+          Free f:cell     name = "C"         column letters; a Ref edge lands HERE
+            Lit int|float|str f:value        a literal cell; kind is a function
+                                             of the SPELLING (see lit_kind), so
+                                             both arms carry identical information
+            Empty f:value                    referenced but blank (materialised)
+            Formula [array|datatable] f:value
+              <expression sequence>
+      Names f:names                          LAST child, if any defined names
+        Free f:name       name = "Revenue"   the workbook's symbol table
+          Ref | Range | Lit str  f:target    what the name denotes
+
+An EXPRESSION SEQUENCE is the formula's tokens with grouping made explicit and
+precedence left implicit -- the syntactic object, lossless without a
+precedence parser (which could be silently wrong):
+
+    Ref f:arg [absr] [absc]     edge -> the Free f:cell it names, or the
+                                Free f:name for a defined-name use. No payload:
+                                the spelling is DERIVED from the target, which is
+                                the one-channel form the pipeline trains.
+    Range f:arg                 Ref f:lo, Ref f:hi (each with abs markers)
+    Free f:arg  name = text     an operand no edge can express: whole column
+                                A:A, structured Table1[Col], a missing sheet,
+                                an unknown name, an external [1]Sheet!A1
+    Lit int|float|str f:arg     a literal operand (text keeps its quotes)
+    Op <op> f:arg               infix; Pre <op> f:arg prefix; Post % f:arg
+    Free func f:arg name=SUM    a call; children Arg f:args, one per argument
+                                (an empty argument is an Arg with no children)
+    Paren f:arg                 explicit grouping
+    Array f:arg                 ArrayRow f:rows > Arg f:args > sequence
+
+WHY THE FIRST VERSION WAS LOSSY. It emitted operands as a flat sequence and
+dropped separators and parentheses as "carrying no information the tree does
+not". ``SUM(A1,B1)*2`` and ``SUM(A1,B1*2)`` then had the same tree. A model
+scored on that object is scored on less than the text arm must predict; the
+comparison would have been rigged in our favour by construction.
+
+ORDER. Under BFS every Cell (depth 3) precedes every operand (depth >= 6), so
+EVERY reference is a backward edge -- the address skeleton is emitted before
+any content. Under DFS a reference to a later row is forward and the pipeline
+relabels it ``RefFwd`` with no edge; ``n_forward_dfs`` in the record meta says
+how many. Defined names sit last so a use (deep) -> name (depth 2) is backward
+under BFS and the name's own target (depth 3, last) -> cell is backward too.
+
+Sheet-name and defined-name resolution is CASE-INSENSITIVE, as in Excel.
+
+``valid`` is left empty: the candidate set would be every Cell for every Ref
+(~450 x 1000 ints per record) and it feeds only the ``mask_invalid`` ablation,
+which is therefore unavailable on this corpus.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Any
+
+FIELD = "f:"
+
+REF_RE = re.compile(
+    r"^(?:(?P<sheet>'[^']+'|[A-Za-z_][A-Za-z0-9_.]*)!)?"
+    r"(?P<abscol>\$?)(?P<col>[A-Z]{1,3})(?P<absrow>\$?)(?P<row>[0-9]{1,7})$"
+)
+RANGE_RE = re.compile(r"^(?P<a>[^:]+):(?P<b>[^:]+)$")
+INT_RE = re.compile(r"^-?[0-9]+$")
+FLOAT_RE = re.compile(r"^-?([0-9]+\.[0-9]*|\.[0-9]+|[0-9]+)([eE][+-]?[0-9]+)?$")
+PLAIN_SHEET_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
+
+#: chars kept of a literal payload or free spelling; both arms see the cut.
+PAYLOAD_CAP = 64
+
+#: Reserved by the pipeline; a label head here means something specific.
+RESERVED_HEADS = frozenset({"Lit", "Free", "Ref", "Bind", "RefFwd"})
+
+#: Operator -> label marker. Markers are attribute keys and the ``Node`` model
+#: validates them as HTML attribute names (``^[A-Za-z_:][A-Za-z0-9_\-:.]*$``),
+#: so ``+`` cannot be one. Words, then; the inverse map renders them back.
+OP_MARKER = {
+    "+": "add", "-": "sub", "*": "mul", "/": "div", "^": "pow", "&": "concat",
+    "=": "eq", "<": "lt", ">": "gt", "<=": "le", ">=": "ge", "<>": "ne", "%": "pct",
+    " ": "isect", ",": "union", ":": "rng",
+}
+MARKER_OP = {v: k for k, v in OP_MARKER.items()}
+
+
+class ConversionError(ValueError):
+    """A workbook or formula that cannot be represented exactly."""
+
+
+# ---------------------------------------------------------------------------
+# small helpers
+# ---------------------------------------------------------------------------
+
+
+def col_letters(n: int) -> str:
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def colnum(c: str) -> int:
+    n = 0
+    for ch in c:
+        n = n * 26 + (ord(ch) - 64)
+    return n
+
+
+def lit_kind(s: str) -> str:
+    """The ``Lit`` kind marker, a function of the spelling only.
+
+    A text cell "100" and a number cell 100 both become ``Lit int`` -- Excel's
+    type distinction is dropped, and dropped for BOTH arms, so neither is
+    asked to predict something the other is not."""
+    if INT_RE.match(s):
+        return "int"
+    if FLOAT_RE.match(s):
+        return "float"
+    return "str"
+
+
+def cap_literal(s: str) -> str:
+    """Cap a formula literal, keeping a quoted string's closing quote so the
+    capped formula is still a formula (an unclosed quote is not)."""
+    if len(s) <= PAYLOAD_CAP:
+        return s
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        return s[: PAYLOAD_CAP - 1] + '"'
+    return s[:PAYLOAD_CAP]
+
+
+def cap_formula_literals(formula: str) -> str:
+    """The source formula with the same cap applied: what the record can hold."""
+    out: list[str] = []
+    for t in tokenize(formula):
+        if t.type == "WHITE-SPACE":
+            continue
+        if t.type == "OPERAND" and t.subtype != "RANGE":
+            out.append(cap_literal(str(t.value)))
+        else:
+            out.append(t.value)
+    return "=" + "".join(out)
+
+
+def cell_text(v: Any) -> tuple[str, str | None]:
+    """Normalise an openpyxl cell value to (text, formula_kind).
+
+    openpyxl hands back plain strings for ordinary formulas but OBJECTS for
+    array formulas and what-if data tables; ``str()`` on those is a memory
+    address (shipped as a cell value once, on 427 of 11,900 cells)."""
+    from openpyxl.worksheet.formula import ArrayFormula, DataTableFormula
+
+    if isinstance(v, ArrayFormula):
+        return str(v.text or "="), "array"
+    if isinstance(v, DataTableFormula):
+        return f"=TABLE({v.r1 or ''},{v.r2 or ''})", "datatable"
+    return str(v), None
+
+
+def quote_sheet(title: str) -> str:
+    """Excel's quoting rule for a sheet qualifier, approximately."""
+    if PLAIN_SHEET_RE.match(title) and not REF_RE.match(title):
+        return title
+    return "'" + title.replace("'", "''") + "'"
+
+
+# ---------------------------------------------------------------------------
+# the node type used while building
+# ---------------------------------------------------------------------------
+
+
+class N:
+    __slots__ = ("tag", "markers", "field", "children", "payload", "name", "ref_key", "idx",
+                 "parent")
+
+    def __init__(self, tag: str, field: str | None, *markers: str,
+                 payload: str | None = None, name: str | None = None):
+        self.tag = tag
+        self.markers = list(markers)
+        self.field = field
+        self.children: list[N] = []
+        self.payload = payload
+        self.name = name
+        self.ref_key: str | None = None  # "sheet!R7C3" or "name:Revenue"
+        self.idx = -1
+        self.parent: N | None = None
+
+    def add(self, c: N) -> N:
+        self.children.append(c)
+        return c
+
+    def label(self) -> str:
+        return " ".join([self.tag, *self.markers, *([FIELD + self.field] if self.field else [])])
+
+    def json(self) -> dict:
+        attrs = {m: "" for m in self.markers}
+        if self.field:
+            attrs[FIELD + self.field] = ""
+        return {"tag": self.tag, "attributes": attrs, "children": [c.json() for c in self.children]}
+
+
+# ---------------------------------------------------------------------------
+# formula text -> expression sequence
+# ---------------------------------------------------------------------------
+
+
+class Resolver:
+    """Resolves reference text to a key the builder later maps to a node."""
+
+    def __init__(self, sheet_titles: list[str], names: dict[str, str]):
+        self.sheets = {t.lower(): t for t in sheet_titles}
+        self.names = {k.lower(): k for k in names}
+        self.stats: dict[str, int] = {}
+
+    def bump(self, k: str) -> None:
+        self.stats[k] = self.stats.get(k, 0) + 1
+
+    def cell_key(self, text: str, home: str) -> tuple[str | None, bool, bool]:
+        """(key or None, absrow, abscol) for an A1 reference."""
+        m = REF_RE.match(text)
+        if not m:
+            return None, False, False
+        sh = m.group("sheet")
+        if sh:
+            sh = sh.strip("'").replace("''", "'")
+            title = self.sheets.get(sh.lower())
+            if title is None:
+                self.bump("missing_sheet")
+                return None, False, False
+        else:
+            title = home
+        return (
+            f"{title}!R{int(m.group('row'))}C{colnum(m.group('col'))}",
+            bool(m.group("absrow")),
+            bool(m.group("abscol")),
+        )
+
+    def name_key(self, text: str) -> str | None:
+        k = self.names.get(text.strip("'").lower())
+        return f"name:{k}" if k else None
+
+
+def tokenize(formula: str):
+    from openpyxl.formula.tokenizer import Tokenizer
+
+    return Tokenizer(formula).items
+
+
+def _operand(parent: N, text: str, home: str, res: Resolver, field: str = "arg") -> None:
+    """One OPERAND RANGE token -> Ref / Range / Free."""
+    res.bump("operands")
+    m = RANGE_RE.match(text)
+    if m:
+        a, b = m.group("a"), m.group("b")
+        # `Sheet!A1:B2` -- the qualifier applies to both ends
+        am = REF_RE.match(a)
+        if am and am.group("sheet") and "!" not in b:
+            b = f"{am.group('sheet')}!{b}"
+        ka, ra, ca = res.cell_key(a, home)
+        kb, rb, cb = res.cell_key(b, home)
+        if ka and kb:
+            rng = parent.add(N("Range", field))
+            lo = rng.add(N("Ref", "lo", *(["absr"] if ra else []), *(["absc"] if ca else [])))
+            hi = rng.add(N("Ref", "hi", *(["absr"] if rb else []), *(["absc"] if cb else [])))
+            lo.ref_key, hi.ref_key = ka, kb
+            res.bump("resolved")
+            return
+        res.bump("free_range")
+        parent.add(N("Free", field, name=text[:PAYLOAD_CAP]))
+        return
+    k, r, c = res.cell_key(text, home)
+    if k:
+        n = parent.add(N("Ref", field, *(["absr"] if r else []), *(["absc"] if c else [])))
+        n.ref_key = k
+        res.bump("resolved")
+        return
+    nk = res.name_key(text)
+    if nk:
+        n = parent.add(N("Ref", field))
+        n.ref_key = nk
+        res.bump("resolved")
+        res.bump("via_name")
+        return
+    res.bump("free_operand")
+    parent.add(N("Free", field, name=text[:PAYLOAD_CAP]))
+
+
+def build_expression(parent: N, formula: str, home: str, res: Resolver) -> None:
+    """Formula text -> expression sequence under ``parent``. Raises on junk."""
+    try:
+        toks = tokenize(formula)
+    except Exception as e:  # openpyxl's tokenizer is strict; refuse the workbook
+        raise ConversionError(f"tokenizer: {e}") from e
+    stack: list[N] = [parent]  # innermost sequence container
+
+    def cur() -> N:
+        return stack[-1]
+
+    for t in toks:
+        v, ty, sub = t.value, t.type, t.subtype
+        if ty == "OPERAND":
+            if sub == "RANGE":
+                _operand(cur(), v, home, res)
+            else:
+                s = cap_literal(str(v))
+                cur().add(N("Lit", "arg", lit_kind(s), payload=s))
+        elif ty == "FUNC":
+            if sub == "OPEN":
+                fn = cur().add(N("Free", "arg", "func", name=v.rstrip("(")[:PAYLOAD_CAP]))
+                stack.append(fn)
+                stack.append(fn.add(N("Arg", "args")))
+            else:  # CLOSE
+                if len(stack) < 3:
+                    raise ConversionError("unbalanced function close")
+                stack.pop()  # Arg
+                stack.pop()  # Free func
+        elif ty == "PAREN":
+            if sub == "OPEN":
+                stack.append(cur().add(N("Paren", "arg")))
+            else:
+                if len(stack) < 2 or cur().tag != "Paren":
+                    raise ConversionError("unbalanced paren")
+                stack.pop()
+        elif ty == "ARRAY":
+            if sub == "OPEN":
+                arr = cur().add(N("Array", "arg"))
+                row = arr.add(N("ArrayRow", "rows"))
+                stack.extend([arr, row, row.add(N("Arg", "args"))])
+            else:
+                if len(stack) < 4:
+                    raise ConversionError("unbalanced array")
+                stack.pop(); stack.pop(); stack.pop()
+        elif ty == "SEP":
+            if sub == "ARG":
+                if cur().tag != "Arg":
+                    raise ConversionError("separator outside an argument list")
+                stack.pop()
+                stack.append(cur().add(N("Arg", "args")))
+            else:  # ROW, inside an array
+                if cur().tag != "Arg" or stack[-2].tag != "ArrayRow":
+                    raise ConversionError("row separator outside an array")
+                stack.pop(); stack.pop()
+                row = cur().add(N("ArrayRow", "rows"))
+                stack.extend([row, row.add(N("Arg", "args"))])
+        elif ty in ("OPERATOR-INFIX", "OPERATOR-PREFIX", "OPERATOR-POSTFIX"):
+            mk = OP_MARKER.get(v)
+            if mk is None:
+                raise ConversionError(f"operator {v!r}")
+            cur().add(N({"OPERATOR-INFIX": "Op", "OPERATOR-PREFIX": "Pre",
+                         "OPERATOR-POSTFIX": "Post"}[ty], "arg", mk))
+        elif ty == "WHITE-SPACE":
+            continue
+        else:
+            raise ConversionError(f"token type {ty}/{sub}")
+    if len(stack) != 1:
+        raise ConversionError("unterminated group")
+
+
+# ---------------------------------------------------------------------------
+# workbook -> record
+# ---------------------------------------------------------------------------
+
+
+def defined_names(wb) -> dict[str, str]:
+    """name -> destination text (``Sheet!A1:B2`` or a raw attr_text)."""
+    out: dict[str, str] = {}
+    try:
+        items = list(wb.defined_names.items())
+    except Exception:
+        return out
+    for name, dn in items:
+        try:
+            dests = list(dn.destinations)
+        except Exception:
+            dests = []
+        if len(dests) == 1 and dests[0][0] and dests[0][1]:
+            sheet, ref = dests[0]
+            out[str(name)] = f"{quote_sheet(sheet)}!{ref.replace('$', '')}"
+        else:
+            # a LAMBDA / constant name yields a destination with no sheet
+            # (7 workbooks of 66k crashed here before this branch existed)
+            txt = getattr(dn, "attr_text", None) or getattr(dn, "value", None)
+            if txt:
+                out[str(name)] = str(txt)
+    return out
+
+
+def workbook_to_record(wb, wb_name: str, max_cells: int) -> dict | None:
+    """One record for the WHOLE workbook, so cross-sheet references resolve.
+
+    Returns None for workbooks that are out of scope (no formula, too big,
+    too small); raises ConversionError for ones that cannot be represented."""
+    root = N("Workbook", None)
+    names = defined_names(wb)
+    res = Resolver([ws.title for ws in wb.worksheets], names)
+    key_node: dict[str, N] = {}
+    sheet_node: dict[str, N] = {}
+    row_node: dict[tuple[str, int], N] = {}
+    pending: list[tuple[N, str, str]] = []
+    n_nonempty = n_formula = n_trunc = 0
+
+    for ws in wb.worksheets:
+        rows: dict[int, list] = {}
+        for row in ws.iter_rows():
+            for c in row:
+                v = c.value
+                if v is None or v == "":
+                    continue
+                n_nonempty += 1
+                if n_nonempty > max_cells:
+                    return None
+                rows.setdefault(int(c.row or 0), []).append((int(c.column or 0), v))
+        if not rows:
+            continue
+        sn = root.add(N("Free", "sheet", name=ws.title))
+        sheet_node[ws.title] = sn
+        for r in sorted(rows):
+            rn = sn.add(N("Free", "row", name=str(r)))
+            row_node[(ws.title, r)] = rn
+            for cnum, v in sorted(rows[r]):
+                cell = rn.add(N("Free", "cell", name=col_letters(cnum)))
+                # KEY BEFORE BODY: every cell addressable before any formula
+                # is expanded, or forward / cross-sheet edges silently fail.
+                key_node[f"{ws.title}!R{r}C{cnum}"] = cell
+                text, kind = cell_text(v)
+                if text.startswith("=") and len(text) > 1:
+                    n_formula += 1
+                    pending.append((cell.add(N("Formula", "value", *([kind] if kind else []))),
+                                    text, ws.title))
+                else:
+                    if len(text) > PAYLOAD_CAP:
+                        n_trunc += 1
+                    s = text[:PAYLOAD_CAP]
+                    cell.add(N("Lit", "value", lit_kind(s), payload=s))
+
+    if n_formula == 0 or n_nonempty < 8:
+        return None
+
+    for fn, text, home in pending:
+        build_expression(fn, text, home, res)  # WITH the "=": the tokenizer needs it
+
+    # the symbol table, LAST so every use of it is a backward edge under BFS
+    name_nodes: dict[str, N] = {}
+    if names:
+        sec = root.add(N("Names", "names"))
+        for nm, dest in names.items():
+            dn = sec.add(N("Free", "name", name=nm[:PAYLOAD_CAP]))
+            name_nodes[f"name:{nm}"] = dn
+            # a name's own target: through the same operand rule, so it is a
+            # Ref / Range where it can be and a spelled Lit where it cannot
+            sub = Resolver([ws.title for ws in wb.worksheets], {})
+            probe = N("Probe", None)
+            try:
+                _operand(probe, dest, "", sub, field="target")
+            except Exception:
+                probe.children = []
+            if probe.children and probe.children[0].tag in ("Ref", "Range"):
+                dn.children = probe.children
+            else:
+                dn.add(N("Lit", "target", "str", payload=dest[:PAYLOAD_CAP]))
+
+    # MATERIALISE referenced-but-blank cells: the address space is what a
+    # formula references. Ranges contribute only their endpoints, so bounded.
+    wanted: set[str] = set()
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        if n.ref_key and not n.ref_key.startswith("name:"):
+            wanted.add(n.ref_key)
+        stack.extend(n.children)
+    materialised = 0
+    for key in sorted(wanted):
+        if key in key_node:
+            continue
+        sh, rc = key.rsplit("!", 1)  # a sheet title may itself contain "!"
+        r = int(rc[1:].split("C")[0])
+        cnum = int(rc.split("C")[1])
+        sn = sheet_node.get(sh)
+        if sn is None:
+            # the sheet exists but has no content at all; give it a node
+            sn = N("Free", "sheet", name=sh)
+            pos = len(root.children) - (1 if names else 0)
+            root.children.insert(pos, sn)
+            sheet_node[sh] = sn
+        rn = row_node.get((sh, r))
+        if rn is None:
+            rn = N("Free", "row", name=str(r))
+            row_node[(sh, r)] = rn
+            pos = sum(1 for c in sn.children if int(c.name or 0) < r)
+            sn.children.insert(pos, rn)
+        cell = N("Free", "cell", name=col_letters(cnum))
+        cell.add(N("Empty", "value"))
+        pos = sum(1 for c in rn.children if colnum(c.name or "A") < cnum)
+        rn.children.insert(pos, cell)
+        key_node[key] = cell
+        materialised += 1
+    key_node.update(name_nodes)
+
+    # BFS index + DFS index (to report how many edges DFS would forward)
+    order: list[N] = []
+    q = [root]
+    head = 0
+    while head < len(q):
+        n = q[head]
+        head += 1
+        n.idx = len(order)
+        order.append(n)
+        for c in n.children:
+            c.parent = n
+        q.extend(n.children)
+    dfs_idx: dict[int, int] = {}
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        dfs_idx[n.idx] = len(dfs_idx)
+        stack.extend(reversed(n.children))
+
+    refs: dict[int, int] = {}
+    unresolved = cross = n_fwd_dfs = via_name = 0
+    for n in order:
+        if n.ref_key is None:
+            continue
+        tgt = key_node.get(n.ref_key)
+        if tgt is None:
+            unresolved += 1  # cannot happen after materialisation; counted anyway
+            continue
+        if tgt.idx >= n.idx:
+            raise ConversionError(f"forward edge under BFS: {n.idx} -> {tgt.idx}")
+        refs[n.idx] = tgt.idx
+        if dfs_idx[tgt.idx] > dfs_idx[n.idx]:
+            n_fwd_dfs += 1
+        if n.ref_key.startswith("name:"):
+            via_name += 1
+        else:
+            home = _home_title(n)
+            if home is not None and not n.ref_key.startswith(home + "!"):
+                cross += 1
+
+    payloads = {n.idx: n.payload for n in order if n.payload is not None}
+    name_map = {n.idx: n.name for n in order if n.name is not None}
+    st = res.stats
+    return {
+        "tree": root.json(),
+        "refs": sorted(refs.items()),
+        "payloads": {str(k): v for k, v in sorted(payloads.items())},
+        "names": {str(k): v for k, v in sorted(name_map.items())},
+        "valid": [],
+        "exact": True,
+        "meta": {
+            "workbook": wb_name,
+            "n_sheets": len(wb.worksheets),
+            "n_nonempty": n_nonempty,
+            "n_formula": n_formula,
+            "n_defined_names": len(names),
+            "cells_materialised_empty": materialised,
+            "payloads_truncated": n_trunc,
+            "ref_operands": st.get("operands", 0),
+            "ref_operands_resolved": st.get("resolved", 0),
+            "ref_operands_free": st.get("free_operand", 0) + st.get("free_range", 0),
+            "ref_operands_missing_sheet": st.get("missing_sheet", 0),
+            "refs_via_defined_name": via_name,
+            "cross_sheet_refs": cross,
+            "unresolved_refs": unresolved,
+            "n_forward_dfs": n_fwd_dfs,
+        },
+        "id": f"wb-{wb_name[:48]}",
+        "source": "sheetpedia",
+        "n_nodes": len(order),
+        "depth": _depth(root),
+        "n_refs": len(refs),
+        "n_ref_operands": st.get("operands", 0),
+    }
+
+
+def _depth(n: N) -> int:
+    return 0 if not n.children else 1 + max(_depth(c) for c in n.children)
+
+
+def _home_title(n: N) -> str | None:
+    x: N | None = n
+    while x is not None and x.field != "sheet":
+        x = x.parent
+    return x.name if x is not None else None
+
+
+# ---------------------------------------------------------------------------
+# record -> cells (the inversion), and the text form
+# ---------------------------------------------------------------------------
+
+
+def bfs_arrays(tree: dict) -> tuple[list[dict], list[int]]:
+    nodes: list[dict] = []
+    parents: list[int] = []
+    q: list[tuple[dict, int]] = [(tree, -1)]
+    head = 0
+    while head < len(q):
+        n, p = q[head]
+        head += 1
+        nodes.append(n)
+        parents.append(p)
+        for c in n.get("children", ()):
+            q.append((c, len(nodes) - 1))
+    return nodes, parents
+
+
+def field_of(node: dict) -> str | None:
+    for k in node.get("attributes", {}):
+        if k.startswith(FIELD):
+            return k[len(FIELD):]
+    return None
+
+
+def markers_of(node: dict) -> list[str]:
+    return [k for k in node.get("attributes", {}) if not k.startswith(FIELD)]
+
+
+class Decoded:
+    """A record read back: per-sheet cell listings plus the names table.
+
+    ``sheets``: list of (title, [(row, col, kind, text)]) in tree order, kind in
+    {"value", "empty", "formula", "array", "datatable"}; ``names``: list of
+    (name, text). This is the object the text form renders and parses."""
+
+    def __init__(self) -> None:
+        self.sheets: list[tuple[str, list[tuple[int, str, str, str]]]] = []
+        self.names: list[tuple[str, str]] = []
+
+    def as_tuple(self):
+        return (tuple((t, tuple(c)) for t, c in self.sheets), tuple(self.names))
+
+    def __eq__(self, o: object) -> bool:
+        return isinstance(o, Decoded) and self.as_tuple() == o.as_tuple()
+
+
+def record_to_decoded(row: dict) -> Decoded:
+    nodes, parents = bfs_arrays(row["tree"])
+    idx_of = {id(n): i for i, n in enumerate(nodes)}
+    payloads = {int(k): v for k, v in (row.get("payloads") or {}).items()}
+    names = {int(k): v for k, v in (row.get("names") or {}).items()}
+    refs = {int(u): int(d) for u, d in row.get("refs", [])}
+
+    def sheet_of(i: int) -> int:
+        while i >= 0 and field_of(nodes[i]) != "sheet":
+            i = parents[i]
+        return i
+
+    def spell_target(i: int, home_sheet: int, absr: bool, absc: bool) -> str:
+        """The spelling a Ref node derives from its target."""
+        d = refs.get(i)
+        if d is None:
+            return "#REF!"  # a RefFwd / dropped edge has no spelling
+        t = nodes[d]
+        f = field_of(t)
+        if f == "name":
+            return names[d]
+        if f != "cell":
+            return "#REF!"
+        row_i = parents[d]
+        sh_i = parents[row_i]
+        addr = ("$" if absc else "") + names[d] + ("$" if absr else "") + names[row_i]
+        if sh_i != home_sheet:
+            return quote_sheet(names[sh_i]) + "!" + addr
+        return addr
+
+    def render_seq(items: list[dict], home_sheet: int) -> str:
+        out: list[str] = []
+        for c in items:
+            i = idx_of[id(c)]
+            tag, mk = c["tag"], markers_of(c)
+            if tag == "Ref":
+                out.append(spell_target(i, home_sheet, "absr" in mk, "absc" in mk))
+            elif tag == "Range":
+                lo, hi = c["children"]
+                li, hi_i = idx_of[id(lo)], idx_of[id(hi)]
+                a = spell_target(li, home_sheet, "absr" in markers_of(lo), "absc" in markers_of(lo))
+                # the qualifier is written once, on the first endpoint
+                b = spell_target(hi_i, home_sheet, "absr" in markers_of(hi), "absc" in markers_of(hi))
+                if "!" in b and "!" in a:
+                    b = b.split("!", 1)[1]
+                out.append(f"{a}:{b}")
+            elif tag == "Lit":
+                out.append(payloads.get(i, ""))
+            elif tag == "Free" and "func" in mk:
+                args = [render_seq(a["children"], home_sheet) for a in c["children"]]
+                out.append(names.get(i, "") + "(" + ",".join(args) + ")")
+            elif tag == "Free":
+                out.append(names.get(i, ""))
+            elif tag in ("Op", "Pre", "Post"):
+                out.append(MARKER_OP.get(mk[0], "") if mk else "")
+            elif tag == "Paren":
+                out.append("(" + render_seq(c["children"], home_sheet) + ")")
+            elif tag == "Array":
+                rows = [",".join(render_seq(a["children"], home_sheet) for a in r["children"])
+                        for r in c["children"]]
+                out.append("{" + ";".join(rows) + "}")
+            else:
+                raise ConversionError(f"unexpected expression node {tag}")
+        return "".join(out)
+
+    dec = Decoded()
+    for sh in row["tree"]["children"]:
+        si = idx_of[id(sh)]
+        if field_of(sh) == "names":
+            for dn in sh["children"]:
+                dec.names.append((names[idx_of[id(dn)]], render_seq(dn["children"], -1)))
+            continue
+        cells: list[tuple[int, str, str, str]] = []
+        for rn in sh["children"]:
+            r = int(names[idx_of[id(rn)]])
+            for cell in rn["children"]:
+                col = names[idx_of[id(cell)]]
+                body = cell["children"][0]
+                bi = idx_of[id(body)]
+                if body["tag"] == "Lit":
+                    cells.append((r, col, "value", payloads.get(bi, "")))
+                elif body["tag"] == "Empty":
+                    cells.append((r, col, "empty", ""))
+                else:
+                    mk = markers_of(body)
+                    kind = "array" if "array" in mk else "datatable" if "datatable" in mk else "formula"
+                    cells.append((r, col, kind, "=" + render_seq(body["children"], si)))
+        dec.sheets.append((names[si], cells))
+    return dec
+
+
+# ---- the text form ---------------------------------------------------------
+#
+# The formula-view dump: one line per non-empty cell, address TAB content,
+# grouped under a sheet header. This is the SpreadsheetLLM-style serialisation
+# (address,value) and what a formula export prints; CSV would spend a token on
+# every blank of the used range. Escapes keep it one line per cell.
+
+
+def _esc(s: str) -> str:
+    return s.replace("\\", "\\\\").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")
+
+
+def _unesc(s: str) -> str:
+    out: list[str] = []
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "\\" and i + 1 < len(s):
+            nxt = s[i + 1]
+            out.append({"n": "\n", "t": "\t", "r": "\r", "\\": "\\"}.get(nxt, nxt))
+            i += 2
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def render_text(dec: Decoded) -> str:
+    lines: list[str] = []
+    for title, cells in dec.sheets:
+        lines.append("## " + _esc(title))
+        for r, col, kind, text in cells:
+            if kind == "value":
+                # Excel's own rule: a leading apostrophe forces text. Needed
+                # so a value that starts like a formula or a brace group
+                # parses back as a value.
+                body = _esc(("'" + text) if text[:1] in ("=", "{", "'") else text)
+            elif kind == "empty":
+                body = ""
+            elif kind == "formula":
+                body = _esc(text)
+            else:  # array / datatable, Excel's brace display
+                body = "{" + _esc(text) + "}"
+            lines.append(f"{col}{r}\t{body}")
+    if dec.names:
+        lines.append("## @names")
+        for nm, text in dec.names:
+            lines.append(f"{_esc(nm)}\t{_esc(text)}")
+    return "\n".join(lines) + "\n"
+
+
+_ADDR_LINE = re.compile(r"^([A-Z]{1,3})([0-9]{1,7})\t(.*)$")
+
+
+def parse_text(text: str) -> Decoded:
+    dec = Decoded()
+    cells: list | None = None
+    in_names = False
+    for line in text.split("\n"):
+        if line == "":
+            continue
+        if line.startswith("## "):
+            title = _unesc(line[3:])
+            if title == "@names":
+                in_names = True
+                cells = None
+                continue
+            in_names = False
+            cells = []
+            dec.sheets.append((title, cells))
+            continue
+        if in_names:
+            nm, _, body = line.partition("\t")
+            dec.names.append((_unesc(nm), _unesc(body)))
+            continue
+        m = _ADDR_LINE.match(line)
+        if not m or cells is None:
+            raise ConversionError(f"unparseable line {line[:40]!r}")
+        col, r, body = m.group(1), int(m.group(2)), m.group(3)
+        if body == "":
+            cells.append((r, col, "empty", ""))
+        elif body.startswith("{") and body.endswith("}"):
+            inner = _unesc(body[1:-1])
+            kind = "datatable" if inner.startswith("=TABLE(") else "array"
+            cells.append((r, col, kind, inner))
+        elif body.startswith("="):
+            cells.append((r, col, "formula", _unesc(body)))
+        elif body.startswith("'"):
+            cells.append((r, col, "value", _unesc(body)[1:]))
+        else:
+            cells.append((r, col, "value", _unesc(body)))
+    return dec
+
+
+def canonical(dec: Decoded) -> str:
+    import json
+
+    return json.dumps(dec.as_tuple(), ensure_ascii=False, sort_keys=False)

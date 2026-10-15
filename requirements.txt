@@ -1,0 +1,14 @@
+# Core: model, training, evaluation
+torch
+numpy
+tiktoken            # GPT-2 tokenizer for the web and chat packs
+# Pack builders
+selectolax          # HTML5 (lexbor) parser: build_web_pack.py, build_web_tags_pack.py
+markdown-it-py      # Markdown block tree for chat messages: build_chat_pack.py
+pyarrow             # reading WildChat parquet shards: build_chat_pack.py
+huggingface_hub     # fetch_web_shards.py, fetch_wildchat.py
+# Paper, figures, appendix
+matplotlib
+markdown            # make_paper_pdf.py (also needs a Chromium binary; set $CHROMIUM)
+# Tests
+pytest
